@@ -121,7 +121,7 @@ function updateset {
                     $patch.Remove($server)
                 }
             }
-            $state_group.$state =@[}
+            $state_group.$state =@{}
         }
     }
     if($exclude.Count) {
@@ -213,7 +213,7 @@ function getrelated {
    return ($pserv | select -unique)
 }
 
-$copymdeia = {
+$copymedia = {
     param (
         [Object]$server,
         [Object]$configuration
@@ -255,6 +255,7 @@ $copymdeia = {
                Add-Content -Path $file -Value "$datime Media copy failed for $version"
            }
         }
+    }
  }
  
  #endregion HTML&Function Declarations 
@@ -350,7 +351,7 @@ while($wait_counter.Keys.Count) {
                     $new = Invoke-Command -FilePath $scripts."Build-Object" -ComputerName $server -ErrorAction Stop -ArgumentList $temp
                     $details.Add($server,$temp)
                     $patch.Add($server,$new)
-                    $jobs += Start-Job -ScriptBlock $copymdeia -ArgumentList $new,$configuration -Name "Copy-media_$server"
+                    $jobs += Start-Job -ScriptBlock $copymedia -ArgumentList $new,$configuration -Name "Copy-media_$server"
                 }
             }
             elseif([bool](Get-Job -Name "Get-Details_$server" -ea SilentlyContinue)) {
