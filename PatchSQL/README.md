@@ -7,3 +7,5 @@ BuildPatchObject.ps1 contains code that creates a JSON object that contains info
 ChangeConfig.ps1 can be used to update the new target versions that need to applied, and the path of the appropriate .exe file.
 
 Failover.ps1 performs failovers on windows and SQL clusters.
+
+ValiPatch.ps1 validates the patch that was applied to the DataBase server on the OS-level post restart.
