@@ -1,2 +1,2 @@
 # PowerShell
-PowerShell scripts for MS SQL Server patching and related activities
+PowerShell scripts for SQL Server patching and related activities
