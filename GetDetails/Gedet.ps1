@@ -1,548 +1,480 @@
-﻿$run_datime = (Get-Date).ToUniversalTime()
-$target_path = "C:\SQL_Patch"
-if(!(Test-Path "$target_path\ServerDetails")) {
-    if(!(Test-Path $target_path)) {
-        New-Item -Path C: -Name "SQL_PATCH" -ItemType Directory
-    }
-    New-Item -Path $target_path -Name "ServerDetails" -ItemType Directory 
+#Requires -Version 5.1
+param(
+    [string]$TargetPath = "C:\SQL_Patch",
+    [string]$Domain     = "AD-ENT"
+)
+
+$run_datetime = (Get-Date).ToUniversalTime()
+$details_path = "$TargetPath\ServerDetails"
+
+if (!(Test-Path $details_path)) {
+    New-Item -Path $TargetPath -Name "ServerDetails" -ItemType Directory -Force | Out-Null
 }
- 
- 
- $instances = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server').InstalledInstances
- $cluser_flag=$false
- $domain = "AD-ENT"
- $access_groups = @("$domain\PRV_EDM_DA_SRV_SQL_PF","$domain\PRV_EDM_DA_SRV_WFISDBAdmins")
- 
- if($instances) {
-     $services = Get-WmiObject win32_service | ? {$_.name -like "*SQL*" -or $_.name -like "*OLAP*" -or $_.name -like "MsDts*" -or $_.name -like "*ReportServer*" -or $_.name -like "*DBSmart*" -or $_.name -like "clusSvc"} |Select-Object Name,State,StartMode,StartName  
-     $lastbootup = Get-WmiObject win32_operatingsystem | select @{LABEL='LastBootUpTime';EXPRESION={$_.ConverttoDateTime($_.lastbootuptime}}
-     $disks = gwmi win32_logicaldisk | select DeviceId, @{n="Size";e={[math]::Round($_.Size/1GB,2)}},@{n="Freespace";e={[math]::Round($_.FreeSpace/1GB,2)}}
-     $obj_server = [PSCustomObject]@{
-         ServerName = $env:COMPUTERNAME
-         Services = $services
-         Instaces = @()
-         is_Accessible =$false
-         LastBootUpTime = $lastbootup.LastBootUpTime
-         Disks = $disks
-         Ran_at = $run_datime
-         Domain = $domain
-     }
-     
-     #region check for local admin group 
-     $admin_groups = net localgroup adminstrators
-     foreach($line in $admin_groups) {
-         if($line -in $access_groups) {
-            $obj_server.Is_Accessible = $true
-            Break;
-         }
-     }
-     #endregion check for local admin group
-     
-     foreach ($instances in $instances) {
-      
-        $path = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Serve\Instance Names\SQL').$instance
-        $pathlevel = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$path\Setup").PatchLevel
-        $tcpport = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$path\MSQLServer\SuperSocketNetLib\Tcp\IPAll").TcpPort
-        if($tcpport) {
-            $type="STATIC"
-        }
-        else {
-            $type="DYNAMIC"
-            $tcpport = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$path\MSQLServer\SuperSocketNetLib\Tcp\IPAll").TcpDynamicPorts
-        }
-        switch -Wildcard ($pathlevel) {
-            "10.0*" {$SQL_Version = "SQL2008"}
-            "10.50*" {$SQL_Version = "SQL2008R2"}
-            "11.*" {$SQL_Version = "SQL2012"}
-            "12.*" {$SQL_Version = "SQL2014"}
-            "13.*" {$SQL_Version = "SQL2016"}
-            "14.*" {$SQL_Version = "SQL2017"}
-        }
 
-        $obj_instance = [PSCustomObejct]@{
-            InstanceName = $instance
-            PatchLevel = $patchlevel
-            SQL_Version = $SQL_Version
-            TCP_PORT_TYPE = $type
-            TCP_PORT_NUMBER = $tcpport
-            is_Active = $false
-            Databases = @()
-            is_Accessible = $false
-            is_Clustered = $false
-            is_AlwaysOn = $false
-            Connection_String="$env:Computername\$instance,$tcpport"
-            HADR = @()
-        }
+$access_groups = @("$Domain\PRV_EDM_DA_SRV_SQL_PF", "$Domain\PRV_EDM_DA_SRV_WFISDBAdmins")
+$instances     = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server').InstalledInstances
+$cluster_flag  = $false
 
-        $obj_server.Instances += $obj_instance
-        #region Registry info
-        if($instance -eq "MSSQLSERVER") {
-            $engine = $obj_server.Services | ? {$_.Name -eq "MSSQLSERVER"}
-        }
-        else {
-            $engine = $obj_server.Services | ? {$_.Name -eq "MSSQL`$$instance"}
-        }
-        if($engine.state -eq "Running") {
-            $obj_instance.is_Active = $true
-        }
-        else{
-            $obj_instance.is_Accessible = $null;
-        }
-        
-        if(Test-Path "HKLM:\Cluster") {
-            $cluster_flag=$true
-            if (Test-Path "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$path\cluster") {
-                $obj_instance.is_Clustered = $true
-                $flag++
-                $virtualname = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$path\cluster").Clustername
-                $obj_instance | Add-Member -MemberType NoteProperty -Name SQL_VirtualName -Value $virtualname
-                $obj_instance.Connection_String="$Virtualname\$instance,$tcpport"
-            }
+if (!$instances) {
+    Write-Warning "No SQL Server instances found on $env:COMPUTERNAME"
+    return $null
+}
 
-            if (Test-Path "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$path\MSSQLSERVER\HADR") {
-                if ((Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$path\MSSQLSERVER\HADR").HADR_Enabled) {
-                    $obj_instance.is_Alwayson=$true
-                }
-            }
-        }
-        #endregion Registry info
+$services = Get-CimInstance win32_service |
+    Where-Object { $_.Name -like "*SQL*" -or $_.Name -like "*OLAP*" -or
+                   $_.Name -like "MsDts*" -or $_.Name -like "*ReportServer*" -or
+                   $_.Name -like "*DBSmart*" -or $_.Name -like "clusSvc" } |
+    Select-Object Name, State, StartMode, StartName
 
-        if($obj_instance.is_Active) {
-            Try
-            {
-                $SQLConnection = New-Object System.Data.SqlClient.SqlConnection
-                $string = $obj_instance.Connection_String
-                $SQLConnection.ConnectionString ="server=$string;database=master;Intergrated Security=True;"
-                $SQLConnection.Open()
-                $obj_instance.Is_Accessible=$true
-            }
-            catch
-            {
-                [System.Windows.Forms.MessageBox]::show("Failed to connect SQL Server:")
-            }
-            if($obj_instance.is_Accessible) {
-                $SQLCommand = New-Object System.Data.SqlClient.SqlDataAdapter
-                
-                #region about version 
-                $SQLCommand.CommandText = "Select @@version as version;"
-                $SQLCommand.Connection = $SQLConnection
-                $SQLAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
-                $SqlAdapter.SelectCommand = $SQLCommand
-                $About_Version = New-Object System.Data.DataSet
-                $SQLAdapter.fill($About_Version) | out-null
-                $obj_instance | Add-Member -MemberType NoteProperty -Name About_version $About_Version.Tables.rows.version
-                #endregion about version 
-                
-                #region SQL Logins
-                $SQLCommand.CommandText = "Select s.loginname, s.sysadmin, s.securityadmin, s.serveradmin, s.setupadmin,
-                    s,processadmin, s.diskadmin, s.dbcreator, s.bulkadmin, s.hasacess, l.is_disabled
-                    from sys.syslogins s left joi sys.sql_logins l on s.name=l.name;"
-                $SQLCommand.Connection = $SQLConnection
-                $SQLAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
-                $SqlAdapter.SelectCommand = $SQLCommand
-                $SQL_Logins =New-Object System.Data.DataSet
-                $SqlAdapter.fill($SQL_Logins) | out-null
-                $logins=@()
-                $chkAccess = $false
-                foreach($row in $SQL_Logins.Tables.rows) {
-                    $obj_login=[PSCustomObject]@{}
-                    $privillege = @()
-                    foreach($col in ($SQL_Logins.Tables.columnc | select -Property columnname).columname ) {
-                        if(($col -ne "loginname") -and ($col -ne "hasaccess") -and ($col -ne "is_disabled")) {
-                            if($row.$col) {
-                                $privillege += $col
-                            }
-                        }
-                    }
-                    if(($row.loginname -in $access_groups) -and ("sysadmin" -in $privillege) -and ($row.is_disabled -ne $true)) {
-                        $chkAccess = $true
-                    }
-                    $obj_login | Add-Member -MemberType NoteProperty -Name SQL_LoginName -Value $row.loginname
-                    $obj_login | Add-Member -MemberType NoteProperty -Name SQL_Privileges -Value $privilage
-                    $obj_login | Add-Member -MemberType NoteProperty -Name is_Disabled -Value $row.is_disabled
-                    $logins+=$obj_login
-                }
-                if($chkAccess -eq $false) {
-                    $obj_instance.IS_Accessible = $false
-                }
-                $obj_instance | Add-Member -MemberType NoteProperty -Name SQL_Privileges -Value $logins 
-                #endregion SQL Logins
-                
-                #region DB Status
-                $SQLCommand.CommandText = "select name, state_desc, is_read_only,
-                    is_in_standby, is_auto_close_on, is_encrypted,
-                    recovery_model_desc, is_published, is_subscribed,
-                    is_merge_published,is_distributor
-                    from sys.databases;"
-                $SQLCommand.Connection = $SQLConnection 
-                $SQLAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
-                $SqlAdapter.SelectCommand = $SQLCommand
-                $SQLDB_Status = New-Object System.Data.Dataset 
-                $SQLAdapter.fill($SQLDB_Status) |out-null 
+$lastbootup = (Get-CimInstance win32_operatingsystem).LastBootUpTime
+$disks      = Get-CimInstance win32_logicaldisk |
+    Select-Object DeviceId,
+        @{n="Size_GB";      e={[math]::Round($_.Size      / 1GB, 2)}},
+        @{n="FreeSpace_GB"; e={[math]::Round($_.FreeSpace / 1GB, 2)}}
 
-                foreach($row in $SQLDB_Status.Tables.rows) {
-                    if($row.is_published -or $row.is_subscribed -or $row.is_merge_published -or $row.is_distributo) {
-                        $obj_instance.HADR += "REP"
-                        break;
-                    }
-                }
-                #endregion DB Status
+$obj_server = [PSCustomObject]@{
+    ServerName                     = $env:COMPUTERNAME
+    Domain                         = $Domain
+    Services                       = $services
+    Instances                      = @()
+    is_Accessible                  = $false
+    LastBootUpTime                 = $lastbootup
+    Disks                          = $disks
+    Ran_at                         = $run_datetime
+    is_PendingFileRenameOperations = $false
+}
 
-                #region AG data
-                if($obj_instance.is_Alwayson) {
-                    $SQLCommand.CommandText = "Select db.name as DB_name,ag.name as AD_name,
-                        rep.replica_server_name as Replica_name,
-                        drs.is_primary_replica, drs.sunchronization_state_desc,
-                        rep.failover_mode_desc, agl.dns_name as AG_Listener,
-                        rep.secondary_role_allow_connections_desc as ReadableSecondary,
-                        drs.is_suspended, drs.is_local
-                        from sys.availablilty_replicas rep
-                        full outer join sys.dm_hadr_database_replica_states drs on rep.replica_id=drs.replica_id
-                        join sys.availablity_groups ag on ag.group_id=rep.group_id
-                        left join sys.availability_group_listeners agl on agl.group_id=rep.group_id
-                        left join sys.sysdatabases db on db.dbid=drs.database_id;"
-                    $SQLAdapter.SelectCommand = $SQLCommand
-                    $SQLAG_Status = New-Object System.Data.DataSet
-                    $SQLAdapter.fill($SQLAG_Status) | out-null
-                    if(!($SQLAG_Status.Tables.rows)) {
-                        $obj_instance.is_AlwaysOn=$false
-                    }
-                    else {
-                        $obj_instance.HADR += "AG"
-                    }
-                }
-                #endregion AG data
-
-                #region Mirroring data
-                $SQLCommand.CommandText = "select db.name as DB.name, mir.mirroring_state_desc, mir.mirroring_role_desc,
-                    mir.mirroring_partner_instance, mir.mirroring_witness_name
-                    from sys.database_mirroring mir
-                    join sys.sysdatabases db on db.dbid=mir.database_id
-                    where mir.mirroring_guid is not null;"
-                $SQLAdapter.SelectCommand = $SQLCommand
-                $Mirroring_Status = New-Object System.Data.Datatset
-                $SQLAdapter.fill($Mirroring_Status) | Out-Null
-                
-                if($Mirroring_Status.Tables.rows) {
-                    $obj_instance.HADR +="MIR"
-                }
-                #endregion Mirroring data data 
-                
-                #region dbsize, service restart, tempdb
-                $SQLCommand.CommandText = "SELECT Name = DB_Name(database_id),
-                    Size = CAST(SUM(size) * 8. / (1024*10240 AS DECIMAL(12,4))
-                    FROM sys.master_files WITH(NOWAIT)
-                    GROUP BY database_id;"
-                $SQLAdapter.SelectCommand = $SQLCommand
-                $dbsize = New-Object System.Data.DataSet
-                $SQLAdapter.fill($dbsize) | Out-Null
-                
-                $SQLCommand.CommandText = "SELECT sqlserver_start_time FROM sys.dm_os_sys_info;"
-                $SQLAdapter.SelectCommand = $SQLCommand
-                $start_time = New-Object System.Data.DataSet
-                $SQLAdapter.fill($start_time) | Out-Null
-                $obj_instance | Add-Member -MemberType NoteProperty -Name Servie_LastStart -Value $start_time.Tables.sqlserver_start_time
-                
-                $SQLCommand.CommandText = "SELECT Counter_name, cntr_value/1024 as Size_inMB
-                    FROM sys.dm_os_performance_counters
-                    WHERE counter_name IN ('Data file(s) Size (KB)','Log File(s) Size (KB)', Log File(s) Used Size (KB)')
-                    AND instance_name = 'tempdb';"
-                $SQLAdapter.SelectCommand = $SQLCommand
-                $tempdb = New-Object System.Data.DataSet
-                $SQLAdapter.fill($tempdb) | Out-Null
-                $obj_tempdb=[PSCustomObject]@{}
-                foreach($row in $tempdb.Tables.rows) {
-                    switch($row.counter_name_Trim()) {
-                        "Data File(s) Size (KB)" {
-                            $obj_tempdb | Add-Member -MemberType NoteProperty -Name DataFile_inMB -Value $row.Size_inMB
-                        }
-                        "Log File(s) Size (KB)" {
-                            $obj_tempdb | Add-Member -MemberType NoteProperty -Name LogFile_Total_inMB -Value $row.Size_inMB
-                        }
-                        "Log File(s) Used Size (KB)" {
-                            $obj_tempdb | Add-Member -MemberType NoteProperty -Name LogFile_Used_inMB -Value $row.Size_inMB
-                        }
-                    }
-                }
-
-                $obj_instance | Add-Member -MemberType NoteProperty -Name TempDB_Details -Value $obj_tempdb
-
-                #endregion dbsize, service restart, tempdb
-
-                $SQLConnection.close()
-
-                #region backups, jobs
-                $SQLConnection.ConnectionString ="server=$string;database=msdb;Integrated Security=True;"
-                $SQLConnection.Open()
-                $SQLCommand = New-Object System.Data.SqlClient.SqlCommand
-                $SQLCommand.Connection = $SQLConnection
-                $SQLCommand.CommandText = "select bset.database_name,BackupSize_inMB = CAST(bset.backup_size / (1024*1024) AS DECIMAL(12,4)),
-                    bset.backup_finish_date as Latest_BackupDate,
-                    CASE bset.[type]
-                        WHEN 'D' THEN 'Full'
-                        WHEN 'I' THEN 'Differential'
-                        WHEN 'L' THEN 'Transaction Log'
-                        ELSE bset.[type]
-                    END as BackupType,
-                    bmed.physical_device_name as Latest_BackupMediaPath
-                    from msdb.dbo.backupset bset join msdb.dbo.backupmedia family bmed on bset.media_set_id = bmed.media_set_id
-                    where bset.backup_finish_date = (select max(backup_finish_date) from msdb.dbo.backupset subq where subq.database_name = bset.database_name);"
-                $SQLAdapter.SelectCommand = $SQLCommand
-                $last_backup = New-Object System.Data.DataSet
-                $SQLAdapter.Fill($last_backup) | out-null
-                
-                $SQLCommand.CommandText = "SELECT j.name, sl.name as owner, j.enabled as is_Enabled,
-                    CASE jh.run_status WHEN 0 THEN 'Error Failed'
-                        WHEN 1 THEN 'Succeeded'
-                        WHEN 2 THEN 'Retry'
-                        WHEN 3 THEN 'Cancelled'
-                        WHEN 4 THEN 'In Progress' ELSE
-                        'Status Unknown' END AS 'last_run_status',
-                    ja.run_requested_date as last_run_date,
-                    ja.next_scheduled_run_date as next_run,
-                    jh.message as run_message
-                    FROM (sysjobactivity ja EFT JOIN sysjobhistory jh ON ja.job_history_id = jh.instance_id)
-                    join sysjobs_view j on ja.job_id = j.job_id
-                    join sys.sql_logins sl on j.owner_sid = sl.sid
-                    WHERE ja.session_id=(SELECT MAX (session_id) from sysjobactivity);"
-                $SQLAdapter.SelectCommand = $SQLCommand
-                $SQL_jobs = New-Object System.Data.DataSet
-                $SQLAdapter.fill($SQL_jobs) Out-Null
-                $jobs=@()
-                foreach($row in $SQL_jobs.Tables.rows) {
-                    $obj_job=[PSCustomObject]@{}
-                    $obj_job | Add-Member -MemberType NoteProperty -Name SQL_JobName -Value $row.name
-                    $obj_job | Add-Member -MemberType NoteProperty -Name SQL_JobOwner -Value $row.owner
-                    $obj_job | Add-Member -MemberType NoteProperty -Name is_Enabled -Value $row.is_enabled
-                    $obj_job | Add-Member -MemberType NoteProperty -Name LastRun_Status -Value $row.last_run_status
-                    $obj_job | Add-Member -MemberType NoteProperty -Name LastRun_Data -Value $row.last_data_run
-                    $obj_job | Add-Member -MemberType NoteProperty -Name LastRun_Message -Value $row.run_message 
-                    $obj_job | Add-Member -MemberType NoteProperty -Name NextRun_Date -Value $row.next_run
-                    $jobs+=$obj_job
-                }
-                $obj_instance | Add-Member -MemberType NoteProperty -Name SQL_Jobs -Value $jobs
-                #endregion backups, jobs
-
-                #region logshipping data
-                $SQLCommand.CommandText = "select pdb.primary_database, ls.secondary_server,
-                    ls.secondary_database from log_shipping_primary_secondaries ls
-                    join log_shipping_primary_databases pdb on pdb.primary_id= ls.primary_id;"
-                $SQLAdapter.SelectCommand = $SQLCommand
-                $ls_pri = New-Object System.Data.DataSet
-                $SQLAdapter.fill($ls_pri) | Out-Null
-
-                $SQLCommand.CommandText = "select secondary_database, primary_server,
-                    primary_database from log_shipping_monitor_secondary;"
-                $SQLAdapter.SelectCommand = $SQLCommand
-                $ls_sec = New-Object System.Data.DataSet
-                $SQLAdapter.fill($ls_sec) | Out-Null
-
-                $SQLConnection.Close()
-
-                if($ls_pri.Tables.rows -or $ls_sec.Tables.rows) {
-                    $obj_instance.HADR +="LS"
-                    $SQLConnection.ConnectionString = "server=$string;database=master;Integrated Security=True;"
-                    $SQLConnection.Open()
-                    $SQLCommand = New-Object System.Data.SqlClient.SqlCommand
-                    $SQLConnection.Connection=$SQLConnection
-                    $SQLCommand.CommandText = "sp_help_log_shipping_monitor;"
-                    $SQLAdapter.SelectCommand = $SQLCommand
-                    $ls_det=New-Object System.Data.DataSet
-                    $SQLAdapter.fill($ls_det) | Out-Null
-                    $SQLConnection.close()
-                }
-                #endregion logshipping data
-
-                foreach($table in $SQLDB_Status.Tables) {
-                    foreach($row in $table) {
-                        $obj_database = [PSCustomObject]@{
-                            Name=$row.name
-                            DB_Status=$row.state_desc
-                            is_Read_Only=$row.is_read_only
-                            is_in_Standby=$row.is_in_standby
-                            is_Encrypted=$row.is_Encrypted
-                            is_AutoClose=$row.is_auto_close_on
-                            Recovery_Model=$row.recovery_model_desc
-                            DBSize_inGB=$dbsize.Tables.rows | % -Process {if($_.Name -eq $row.name) {$_.Size} }
-                            HADR=@()
-                        }
-
-                        if($row.name -in $last_backup.Tables.database_name) {
-                            $data_backup = $last_backup.Tables.rows | ? {$_.database_name -eq $row.name}
-                             $obj_database | Add-Member -MemberType NoteProperty -Name Last_BackUp_On -Value $data_backup.Latest_BackupDate
-                             $obj_database | Add-Member -MemberType NoteProperty -Name BackUpSize_inMB -Value $data_backup.BackupSize_inMB
-                             $obj_database | Add-Member -MemberType NoteProperty -Name Backup_Type -Value $data_backup.BackupType
-                             $obj_database | Add-Member -MemberType NoteProperty -Name BackUp_Path -Value $data_backup.Latest_BackupMediaPath
-                        }
-
-                        if($row.is_published -or $row.is_subscribed -or $row.is_merge_published -or $row.is_distributor) {
-                            $obj_database.HADR += "REP"
-                            $rep_role=@()
-                            if($row.is_published) {
-                                $rep_role += "PUBLISHED"
-                            }
-                            if($row.is_subscribed) {
-                                $rep_role += "SUBSCRIBED"
-                            }
-                            if($row.is_merge_published) {
-                                $rep_role += "MERGE-PUBLISHED"
-                            }
-                            if($row.is_distributor) {
-                                $rep_role += "DISTRIBUTOR"
-                            }
-                            $obj_database | Add-Member -MemberType NoteProperty -Name Replication_Role -Value $rep_role
-                        }
-
-                        if($row.name -in $Mirroring_Status.tables.DB_name) {
-                            $obj_database.HADR += "MIR"
-                            $temp_mir=$Mirroring_Status.Tables.rows | ? {$_.DB_name -eq $row.name}
-                            $obj_database | Add-Member -MemberType NoteProperty -Name Mirroring_Role -Value $temp_mir.mirroring_role_desc
-                            $obj_database | Add-Member -MemberType NoteProperty -Name Mirroring_State -Value $temp_mir.mirroring_state_desc
-                            $obj_database | Add-Member -MemberType NoteProperty -Name Mirroring_Partner -Value $temp_mir.mirroring_partner_instance
-                            if($temp_mir.mirroring_witness_name) {
-                                $obj_database | Add-Member -MemberType NoteProperty -Name Mirroring_Witness -Value $temp_mir.mirroring_witness_name
-                            }
-                        }
-
-                        if($row.name -in $SQLAG_Status.Tables.DB_name) {
-                            $obj_database.HADR += "AG"
-                            $temp_ag=$SQLAG_Status.Tables.rows | ? {($_.DB_name -eq $row.name) -and ($_.is_local -eq $true)}
-                            $obj_database | Add-Member -MemberType NoteProperty -Name AG_Name -Value $temp_ag.AG_name
-                            $obj_database | Add-Member -MemberType NoteProperty -Name is_AG_PrimaryReplica -Value $temp_ag.is_primary_replica
-                            if($temp_ag.is_primary_replica) {
-                                $replica_info = $SQLAG_Status.Tables.rows | ? {($_.DB_name -eq $row.name) -and ($_.AG_name -eq $temp_ag.AG_name) -and ($_.is_local -ne $true)}
-                            }
-                            else {
-                                $replica_info = $SQLAG_Status.Tables.rows | ? {($_.AG_name -eq $temp_ag.name) -and ($_.is_local -ne $true)} | select -Property AG_name,Replica_name,availablity_mode_desc_,failover_mode_desc,ReadableSecondary
-                            }
-                            $obj_database | Add-Member -MemberType NoteProperty -Name AG_SyncState -Value $temp_ag.synchronization_state_desc
-                            $obj_database | Add-Member -MemberType NoteProperty -Name AG_HealthState -Value $temp_ag.synchronization_health_desc
-                            $obj_database | Add-Member -MemberType NoteProperty -Name AG_AvailMode -Value $temp_ag.availability_mode_desc
-                            $obj_database | Add-Member -MemberType NoteProperty -Name AG_FailoverMode -Value $temp_ag.failover_mode_desc
-                            $obj_database | Add-Member -MemberType NoteProperty -Name AG_ReadableSecondary -Value $temp_ag.ReadableSecondary
-                            $obj_database | Add-Member -MemberType NoteProperty -Name AG_ReplicaInfo -Value $replica_info
-                            $obj_database | Add-Member -MemberType NoteProperty -Name is_AG_Suspended -Value $temp_ag.is_suspended
-                            if($temp_ag.AG_Listener) {
-                                $obj_database | Add-Member -MemberType NoteProperty -Name AG_Listener -Value $temp_ag.AG_Listener
-                            }
-                        }
-
-                        if(($row.name -in $ls_pri.Tables.primary_database) -or ($row.name -in $ls_sec.Tables.secondary_database)) {
-                            $obj_database.HADR += "LS"
-                            if($row.name -in $ls_pri.Tables.primary_database) {
-                                $temp_ls=$ls_pri.Tables.rows | ? {$_.primary_database -eq $row.name}
-                                $obj_database | Add-Member -MemberType NoteProperty -Name LogShipping_Role -Value "Primary"
-                                $obj_database | Add-Member -MemberType NoteProperty -Name LogShipping_SecondaryServer -Value $temp_ls.secondary_server
-                                $obj_database | Add-Member -MemberType NoteProperty -Name LogShipping_SecondaryDatabase -Value $temp_ls.secondary_database
-                            }
-                            else if($row.name -in $ls_sec.Tables.secondary_database) {
-                                $temp_ls=$ls_sec.Tables.rows | ? {$_.secondary_database -eq $row.name}
-                                $obj_database | Add-Member -MemberType NoteProperty -Name LogShipping_Role -Value "Secondary"
-                                $obj_database | Add-Member -MemberType NoteProperty -Name LogShipping_PrimaryServer -Value $temp_ls.primary_server
-                                $obj_database | Add-Member -MemberType NoteProperty -Name LogShipping_PrimaryServer -Value $temp_ls.primary_server
-                            }
-
-                            $temp_ls=$ls_det.Tables.rows | ? {($_.database_name -eq $row.name) -and ($string -like $_.server+"*")}
-                            if($temp_ls.status -eq $false) {
-                                $ls_status = "Healthy"
-                            }
-                            elseif($temp_ls.status -eq $true) {
-                                $ls_status = "Unhealthy"
-                            }
-                            if($temp_ls.is_primary -eq $true) {
-                                $ls_alert = "is_backup_alert_enabled"
-                            }
-                            elseif($temp_ls.is_primary -eq $false) {
-                                $ls_alert = "is_restore_alert_enabled"
-                            }
-                            $obj_database | Add-Member -MemberType NoteProperty -Name LogShipping_Health -Value $ls_status
-                            $obj_database | Add-Member -MemberType NoteProperty -Name "LogShipping_$ls_alert" -Value $temp_ls.$ls_alert
-
-                        }
-                        
-                        if([bool]($obj_database.HADR.Count)) {
-                            $obj_instance.Databases += $obj_database
-                        }
-                        else {
-                            $obj_instance.Databases +=$obj_database | Select-Object -Property * -ExcludeProperty HADR
-                        }
-                    }
-                }
-
-            }
-        }
+#region Check local admin group
+$admin_output = net localgroup administrators
+foreach ($line in $admin_output) {
+    if ($line -in $access_groups) {
+        $obj_server.is_Accessible = $true
+        break
     }
+}
+#endregion
 
-    #region cluadmin data
-    if($cluser_flag) {
-        $clustername=(Get-ItemProperty "HKLM:\Cluster").ClusterName
-        $Obj_cluster = [PSCustomObject]@{
-            ClusterName = $clustername
-        }
-        if(($obj_server.Services | ? {$_.Name -eq "ClusSvc"}).State -eq "Running") {
-            $groups=@()
-            $clu_resource = Get-ClusterResource | select -Property name, state, ownergroup, resourcetype
-            $clu_group = Get-ClusterGroup | ? {$_.name -ne "Available Storage" -and $_.name -ne "Cluster Group"} | select -Property name, state, ownernode, grouptype, @{N='is_AutoFailback';E={$_.AutoFailbackType}}
-            foreach($g in $clu_group) {
-                $res =@()
-                foreach($r in $clu_resource ) {
-                    if($r.ownergroup -eq  $g.name) {
-                        $obj_clusterresource = [PSCustomObject]@{
-                            Name = $r.Name
-                            State = $r.State.ToString()
-                            ResourceType = $r.ResourceType.Name
-                        }
-                        $res+= $obj_clusterresource
-                    }
-                }
-                $obj_clustergroup = [PSCustomObject]@{
-                    GroupName = $g.Name
-                    State = $g.State.ToString()
-                    OwnerNode = $g.OwnerNode.Name
-                    is_AutoFailback = $g.is_AutoFailback
-                    Group_Resources = $res
-                }
-                $groups+=$obj_clustergroup
-            }
-            $obj_cluster | Add-Member -MemberType NoteProperty -Name Cluster_Groups -Value $groups
-            $clu_nodes = Get-ClusterNode | ? {$_.Name -ne $env:COMPUTERNAME}
-            $clu_partners = @()
-            $clu_nodes | % {
-                $obj_clusterpartner = [PSCustomObject]@{
-                    Name = $_.Name
-                    State = $_.State.ToString()
-                }
-                $clu_partners+=$obj_clusterpartner
-            }
-            $obj_cluster | Add-Member -MemberType NoteProperty -Name Cluster_Partners -Value $clu_partners
-        }
-        $obj_server | Add-Member -MemberType NoteProperty -Name Windows_Cluster -Value $Obj_cluster
-    }
-    #endregion clauadmin data
+function Invoke-SqlQuery {
+    param([System.Data.SqlClient.SqlConnection]$Conn, [string]$Query)
+    $cmd     = New-Object System.Data.SqlClient.SqlCommand($Query, $Conn)
+    $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+    $ds      = New-Object System.Data.DataSet
+    $adapter.Fill($ds) | Out-Null
+    return $ds
+}
 
-    #region reboot required 
-    $rebootreq = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager').PendingFileRenameOperations
-    if($rebootreq) {
-        $obj_server | Add-Member -MemberType NoteProperty -Name is_PendingFileRenameOpertaions -Value $true
+foreach ($instance in $instances) {
+
+    $reg_base   = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL').$instance
+    $patchLevel = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$reg_base\Setup").PatchLevel
+    $tcpAll     = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$reg_base\MSSQLServer\SuperSocketNetLib\Tcp\IPAll" -ErrorAction SilentlyContinue
+    $tcpPort    = $tcpAll.TcpPort
+
+    if ($tcpPort) {
+        $portType = "STATIC"
     }
     else {
-        $obj_server | Add-Member -MemberType NoteProperty -Name is_PendingFileRenameOpertaions -Value $false
+        $portType = "DYNAMIC"
+        $tcpPort  = $tcpAll.TcpDynamicPorts
     }
-    #endregion reboot required
+
+    $sql_version = switch -Wildcard ($patchLevel) {
+        "10.0*"  { "SQL2008"   }
+        "10.50*" { "SQL2008R2" }
+        "11.*"   { "SQL2012"   }
+        "12.*"   { "SQL2014"   }
+        "13.*"   { "SQL2016"   }
+        "14.*"   { "SQL2017"   }
+        "15.*"   { "SQL2019"   }
+        "16.*"   { "SQL2022"   }
+        default  { "Unknown"   }
+    }
+
+    $conn_string = "$env:COMPUTERNAME\$instance,$tcpPort"
+
+    $obj_instance = [PSCustomObject]@{
+        InstanceName      = $instance
+        PatchLevel        = $patchLevel
+        SQL_Version       = $sql_version
+        TCP_PORT_TYPE     = $portType
+        TCP_PORT_NUMBER   = $tcpPort
+        is_Active         = $false
+        is_Accessible     = $false
+        is_Clustered      = $false
+        is_AlwaysOn       = $false
+        Connection_String = $conn_string
+        Databases         = @()
+        HADR              = @()
+    }
+
+    #region Service state
+    if ($instance -eq "MSSQLSERVER") {
+        $engine = $services | Where-Object { $_.Name -eq "MSSQLSERVER" }
+    }
+    else {
+        $engine = $services | Where-Object { $_.Name -eq "MSSQL`$$instance" }
+    }
+    if ($engine.State -eq "Running") { $obj_instance.is_Active = $true }
+    #endregion
+
+    #region Cluster and AlwaysOn (registry)
+    if (Test-Path "HKLM:\Cluster") {
+        $cluster_flag = $true
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$reg_base\Cluster") {
+            $obj_instance.is_Clustered = $true
+            $virtualname = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$reg_base\Cluster").ClusterName
+            $obj_instance | Add-Member -MemberType NoteProperty -Name SQL_VirtualName -Value $virtualname
+            $obj_instance.Connection_String = "$virtualname\$instance,$tcpPort"
+        }
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$reg_base\MSSQLServer\HADR") {
+            if ((Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$reg_base\MSSQLServer\HADR").HADR_Enabled) {
+                $obj_instance.is_AlwaysOn = $true
+            }
+        }
+    }
+    #endregion
+
+    #region SQL queries
+    if ($obj_instance.is_Active) {
+
+        $SQLConnection = New-Object System.Data.SqlClient.SqlConnection
+        $SQLConnection.ConnectionString = "Server=$($obj_instance.Connection_String);Database=master;Integrated Security=True;Connect Timeout=15;"
+
+        try {
+            $SQLConnection.Open()
+            $obj_instance.is_Accessible = $true
+        }
+        catch {
+            Write-Warning "[$instance] Failed to connect: $_"
+        }
+
+        if ($obj_instance.is_Accessible) {
+
+            # SQL version banner
+            $ds = Invoke-SqlQuery -Conn $SQLConnection -Query "SELECT @@VERSION AS version;"
+            $obj_instance | Add-Member -MemberType NoteProperty -Name About_Version -Value $ds.Tables[0].Rows[0]["version"]
+
+            # SQL logins
+            $ds = Invoke-SqlQuery -Conn $SQLConnection -Query "
+                SELECT s.loginname, s.sysadmin, s.securityadmin, s.serveradmin, s.setupadmin,
+                       s.processadmin, s.diskadmin, s.dbcreator, s.bulkadmin, s.hasaccess, l.is_disabled
+                FROM sys.syslogins s
+                LEFT JOIN sys.sql_logins l ON s.name = l.name;"
+
+            $logins    = @()
+            $chkAccess = $false
+            foreach ($row in $ds.Tables[0].Rows) {
+                $privilege = @()
+                foreach ($col in $ds.Tables[0].Columns) {
+                    $colname = $col.ColumnName
+                    if ($colname -notin @("loginname","hasaccess","is_disabled") -and $row[$colname]) {
+                        $privilege += $colname
+                    }
+                }
+                if (($row.loginname -in $access_groups) -and ("sysadmin" -in $privilege) -and ($row.is_disabled -ne $true)) {
+                    $chkAccess = $true
+                }
+                $logins += [PSCustomObject]@{
+                    SQL_LoginName  = $row.loginname
+                    SQL_Privileges = $privilege
+                    is_Disabled    = $row.is_disabled
+                }
+            }
+            if (!$chkAccess) { $obj_instance.is_Accessible = $false }
+            $obj_instance | Add-Member -MemberType NoteProperty -Name SQL_Logins -Value $logins
+
+            # Database status
+            $ds_dbstatus = Invoke-SqlQuery -Conn $SQLConnection -Query "
+                SELECT name, state_desc, is_read_only, is_in_standby, is_auto_close_on, is_encrypted,
+                       recovery_model_desc, is_published, is_subscribed, is_merge_published, is_distributor
+                FROM sys.databases;"
+            foreach ($row in $ds_dbstatus.Tables[0].Rows) {
+                if ($row.is_published -or $row.is_subscribed -or $row.is_merge_published -or $row.is_distributor) {
+                    $obj_instance.HADR += "REP"; break
+                }
+            }
+
+            # Always On AG
+            $ds_ag = New-Object System.Data.DataSet
+            if ($obj_instance.is_AlwaysOn) {
+                $ds_ag = Invoke-SqlQuery -Conn $SQLConnection -Query "
+                    SELECT db.name AS DB_name, ag.name AS AG_name,
+                           rep.replica_server_name AS Replica_name,
+                           drs.is_primary_replica, drs.synchronization_state_desc,
+                           drs.synchronization_health_desc, rep.availability_mode_desc,
+                           rep.failover_mode_desc, agl.dns_name AS AG_Listener,
+                           rep.secondary_role_allow_connections_desc AS ReadableSecondary,
+                           drs.is_suspended, drs.is_local
+                    FROM sys.availability_replicas rep
+                    FULL OUTER JOIN sys.dm_hadr_database_replica_states drs ON rep.replica_id = drs.replica_id
+                    JOIN sys.availability_groups ag ON ag.group_id = rep.group_id
+                    LEFT JOIN sys.availability_group_listeners agl ON agl.group_id = rep.group_id
+                    LEFT JOIN sys.sysdatabases db ON db.dbid = drs.database_id;"
+                if ($ds_ag.Tables[0].Rows.Count -eq 0) { $obj_instance.is_AlwaysOn = $false }
+                else { $obj_instance.HADR += "AG" }
+            }
+
+            # Mirroring
+            $ds_mirror = Invoke-SqlQuery -Conn $SQLConnection -Query "
+                SELECT db.name AS DB_name, mir.mirroring_state_desc, mir.mirroring_role_desc,
+                       mir.mirroring_partner_instance, mir.mirroring_witness_name
+                FROM sys.database_mirroring mir
+                JOIN sys.sysdatabases db ON db.dbid = mir.database_id
+                WHERE mir.mirroring_guid IS NOT NULL;"
+            if ($ds_mirror.Tables[0].Rows.Count -gt 0) { $obj_instance.HADR += "MIR" }
+
+            # DB sizes
+            $ds_sizes = Invoke-SqlQuery -Conn $SQLConnection -Query "
+                SELECT DB_Name(database_id) AS Name,
+                       CAST(SUM(size) * 8.0 / (1024 * 1024) AS DECIMAL(12,4)) AS Size_GB
+                FROM sys.master_files WITH (NOWAIT)
+                GROUP BY database_id;"
+
+            # Service start time
+            $ds_start = Invoke-SqlQuery -Conn $SQLConnection -Query "SELECT sqlserver_start_time FROM sys.dm_os_sys_info;"
+            $obj_instance | Add-Member -MemberType NoteProperty -Name Service_LastStart -Value $ds_start.Tables[0].Rows[0]["sqlserver_start_time"]
+
+            # TempDB
+            $ds_tempdb = Invoke-SqlQuery -Conn $SQLConnection -Query "
+                SELECT counter_name, cntr_value / 1024 AS Size_inMB
+                FROM sys.dm_os_performance_counters
+                WHERE counter_name IN (
+                    'Data File(s) Size (KB)',
+                    'Log File(s) Size (KB)',
+                    'Log File(s) Used Size (KB)')
+                  AND instance_name = 'tempdb';"
+            $obj_tempdb = [PSCustomObject]@{}
+            foreach ($row in $ds_tempdb.Tables[0].Rows) {
+                switch ($row.counter_name.Trim()) {
+                    "Data File(s) Size (KB)"     { $obj_tempdb | Add-Member NoteProperty DataFile_inMB      $row.Size_inMB }
+                    "Log File(s) Size (KB)"      { $obj_tempdb | Add-Member NoteProperty LogFile_Total_inMB $row.Size_inMB }
+                    "Log File(s) Used Size (KB)" { $obj_tempdb | Add-Member NoteProperty LogFile_Used_inMB  $row.Size_inMB }
+                }
+            }
+            $obj_instance | Add-Member -MemberType NoteProperty -Name TempDB_Details -Value $obj_tempdb
+
+            $SQLConnection.Close()
+
+            # Backups and Agent Jobs (msdb)
+            $SQLConnection.ConnectionString = "Server=$($obj_instance.Connection_String);Database=msdb;Integrated Security=True;Connect Timeout=15;"
+            $SQLConnection.Open()
+
+            $ds_backup = Invoke-SqlQuery -Conn $SQLConnection -Query "
+                SELECT bset.database_name,
+                       CAST(bset.backup_size / (1024.0 * 1024) AS DECIMAL(12,4)) AS BackupSize_inMB,
+                       bset.backup_finish_date AS Latest_BackupDate,
+                       CASE bset.[type]
+                           WHEN 'D' THEN 'Full'
+                           WHEN 'I' THEN 'Differential'
+                           WHEN 'L' THEN 'Transaction Log'
+                           ELSE bset.[type]
+                       END AS BackupType,
+                       bmed.physical_device_name AS Latest_BackupMediaPath
+                FROM msdb.dbo.backupset bset
+                JOIN msdb.dbo.backupmediafamily bmed ON bset.media_set_id = bmed.media_set_id
+                WHERE bset.backup_finish_date = (
+                    SELECT MAX(backup_finish_date) FROM msdb.dbo.backupset subq
+                    WHERE subq.database_name = bset.database_name);"
+
+            $ds_jobs = Invoke-SqlQuery -Conn $SQLConnection -Query "
+                SELECT j.name, sl.name AS owner, j.enabled AS is_Enabled,
+                       CASE jh.run_status
+                           WHEN 0 THEN 'Failed'   WHEN 1 THEN 'Succeeded'
+                           WHEN 2 THEN 'Retry'    WHEN 3 THEN 'Cancelled'
+                           WHEN 4 THEN 'In Progress' ELSE 'Unknown'
+                       END AS last_run_status,
+                       ja.run_requested_date AS last_run_date,
+                       ja.next_scheduled_run_date AS next_run,
+                       jh.message AS run_message
+                FROM sysjobactivity ja
+                LEFT JOIN sysjobhistory jh ON ja.job_history_id = jh.instance_id
+                JOIN sysjobs_view j ON ja.job_id = j.job_id
+                JOIN sys.sql_logins sl ON j.owner_sid = sl.sid
+                WHERE ja.session_id = (SELECT MAX(session_id) FROM sysjobactivity);"
+            $sql_jobs = @()
+            foreach ($row in $ds_jobs.Tables[0].Rows) {
+                $sql_jobs += [PSCustomObject]@{
+                    SQL_JobName     = $row.name
+                    SQL_JobOwner    = $row.owner
+                    is_Enabled      = $row.is_Enabled
+                    LastRun_Status  = $row.last_run_status
+                    LastRun_Date    = $row.last_run_date
+                    LastRun_Message = $row.run_message
+                    NextRun_Date    = $row.next_run
+                }
+            }
+            $obj_instance | Add-Member -MemberType NoteProperty -Name SQL_Jobs -Value $sql_jobs
+
+            # Log Shipping
+            $ds_ls_pri = Invoke-SqlQuery -Conn $SQLConnection -Query "
+                SELECT pdb.primary_database, ls.secondary_server, ls.secondary_database
+                FROM log_shipping_primary_secondaries ls
+                JOIN log_shipping_primary_databases pdb ON pdb.primary_id = ls.primary_id;"
+            $ds_ls_sec = Invoke-SqlQuery -Conn $SQLConnection -Query "
+                SELECT secondary_database, primary_server, primary_database
+                FROM log_shipping_monitor_secondary;"
+            $SQLConnection.Close()
+
+            $ds_ls_det = New-Object System.Data.DataSet
+            if ($ds_ls_pri.Tables[0].Rows.Count -gt 0 -or $ds_ls_sec.Tables[0].Rows.Count -gt 0) {
+                $obj_instance.HADR += "LS"
+                $SQLConnection.ConnectionString = "Server=$($obj_instance.Connection_String);Database=master;Integrated Security=True;Connect Timeout=15;"
+                $SQLConnection.Open()
+                $ds_ls_det = Invoke-SqlQuery -Conn $SQLConnection -Query "EXEC sp_help_log_shipping_monitor;"
+                $SQLConnection.Close()
+            }
+
+            # Build per-database objects
+            foreach ($row in $ds_dbstatus.Tables[0].Rows) {
+                $size_row     = $ds_sizes.Tables[0].Rows | Where-Object { $_.Name -eq $row.name }
+                $obj_database = [PSCustomObject]@{
+                    Name           = $row.name
+                    DB_Status      = $row.state_desc
+                    is_Read_Only   = $row.is_read_only
+                    is_in_Standby  = $row.is_in_standby
+                    is_Encrypted   = $row.is_encrypted
+                    is_AutoClose   = $row.is_auto_close_on
+                    Recovery_Model = $row.recovery_model_desc
+                    DBSize_inGB    = if ($size_row) { $size_row.Size_GB } else { $null }
+                    HADR           = @()
+                }
+
+                $bk = $ds_backup.Tables[0].Rows | Where-Object { $_.database_name -eq $row.name }
+                if ($bk) {
+                    $obj_database | Add-Member NoteProperty Last_BackUp_On  $bk.Latest_BackupDate
+                    $obj_database | Add-Member NoteProperty BackUpSize_inMB $bk.BackupSize_inMB
+                    $obj_database | Add-Member NoteProperty Backup_Type     $bk.BackupType
+                    $obj_database | Add-Member NoteProperty BackUp_Path     $bk.Latest_BackupMediaPath
+                }
+
+                if ($row.is_published -or $row.is_subscribed -or $row.is_merge_published -or $row.is_distributor) {
+                    $obj_database.HADR += "REP"
+                    $rep_role = @()
+                    if ($row.is_published)       { $rep_role += "PUBLISHED" }
+                    if ($row.is_subscribed)      { $rep_role += "SUBSCRIBED" }
+                    if ($row.is_merge_published) { $rep_role += "MERGE-PUBLISHED" }
+                    if ($row.is_distributor)     { $rep_role += "DISTRIBUTOR" }
+                    $obj_database | Add-Member NoteProperty Replication_Role $rep_role
+                }
+
+                $mir_row = $ds_mirror.Tables[0].Rows | Where-Object { $_.DB_name -eq $row.name }
+                if ($mir_row) {
+                    $obj_database.HADR += "MIR"
+                    $obj_database | Add-Member NoteProperty Mirroring_Role    $mir_row.mirroring_role_desc
+                    $obj_database | Add-Member NoteProperty Mirroring_State   $mir_row.mirroring_state_desc
+                    $obj_database | Add-Member NoteProperty Mirroring_Partner $mir_row.mirroring_partner_instance
+                    if ($mir_row.mirroring_witness_name) {
+                        $obj_database | Add-Member NoteProperty Mirroring_Witness $mir_row.mirroring_witness_name
+                    }
+                }
+
+                if ($ds_ag.Tables.Count -gt 0) {
+                    $ag_row = $ds_ag.Tables[0].Rows | Where-Object { $_.DB_name -eq $row.name -and $_.is_local -eq $true }
+                    if ($ag_row) {
+                        $obj_database.HADR += "AG"
+                        $replica_info = if ($ag_row.is_primary_replica) {
+                            $ds_ag.Tables[0].Rows | Where-Object { $_.DB_name -eq $row.name -and $_.is_local -ne $true }
+                        } else {
+                            $ds_ag.Tables[0].Rows | Where-Object { $_.AG_name -eq $ag_row.AG_name -and $_.is_local -ne $true } |
+                                Select-Object AG_name, Replica_name, availability_mode_desc, failover_mode_desc, ReadableSecondary
+                        }
+                        $obj_database | Add-Member NoteProperty AG_Name              $ag_row.AG_name
+                        $obj_database | Add-Member NoteProperty is_AG_PrimaryReplica $ag_row.is_primary_replica
+                        $obj_database | Add-Member NoteProperty AG_SyncState         $ag_row.synchronization_state_desc
+                        $obj_database | Add-Member NoteProperty AG_HealthState       $ag_row.synchronization_health_desc
+                        $obj_database | Add-Member NoteProperty AG_AvailMode         $ag_row.availability_mode_desc
+                        $obj_database | Add-Member NoteProperty AG_FailoverMode      $ag_row.failover_mode_desc
+                        $obj_database | Add-Member NoteProperty AG_ReadableSecondary $ag_row.ReadableSecondary
+                        $obj_database | Add-Member NoteProperty AG_ReplicaInfo       $replica_info
+                        $obj_database | Add-Member NoteProperty is_AG_Suspended      $ag_row.is_suspended
+                        if ($ag_row.AG_Listener) {
+                            $obj_database | Add-Member NoteProperty AG_Listener $ag_row.AG_Listener
+                        }
+                    }
+                }
+
+                $in_ls_pri = $ds_ls_pri.Tables[0].Rows | Where-Object { $_.primary_database   -eq $row.name }
+                $in_ls_sec = $ds_ls_sec.Tables[0].Rows | Where-Object { $_.secondary_database -eq $row.name }
+                if ($in_ls_pri -or $in_ls_sec) {
+                    $obj_database.HADR += "LS"
+                    if ($in_ls_pri) {
+                        $obj_database | Add-Member NoteProperty LogShipping_Role              "Primary"
+                        $obj_database | Add-Member NoteProperty LogShipping_SecondaryServer   $in_ls_pri.secondary_server
+                        $obj_database | Add-Member NoteProperty LogShipping_SecondaryDatabase $in_ls_pri.secondary_database
+                    }
+                    elseif ($in_ls_sec) {
+                        $obj_database | Add-Member NoteProperty LogShipping_Role            "Secondary"
+                        $obj_database | Add-Member NoteProperty LogShipping_PrimaryServer   $in_ls_sec.primary_server
+                        $obj_database | Add-Member NoteProperty LogShipping_PrimaryDatabase $in_ls_sec.primary_database
+                    }
+                    if ($ds_ls_det.Tables.Count -gt 0) {
+                        $ls_row = $ds_ls_det.Tables[0].Rows | Where-Object {
+                            $_.database_name -eq $row.name -and $obj_instance.Connection_String -like ($_.server + "*")
+                        }
+                        if ($ls_row) {
+                            $ls_health = if ($ls_row.status -eq $false) { "Healthy" } else { "Unhealthy" }
+                            $ls_alert  = if ($ls_row.is_primary -eq $true) { "is_backup_alert_enabled" } else { "is_restore_alert_enabled" }
+                            $obj_database | Add-Member NoteProperty LogShipping_Health         $ls_health
+                            $obj_database | Add-Member NoteProperty "LogShipping_$ls_alert"    $ls_row.$ls_alert
+                        }
+                    }
+                }
+
+                if ($obj_database.HADR.Count -gt 0) {
+                    $obj_instance.Databases += $obj_database
+                } else {
+                    $obj_instance.Databases += $obj_database | Select-Object -Property * -ExcludeProperty HADR
+                }
+            }
+        }
+    }
+
+    $obj_server.Instances += $obj_instance
 }
- 
- $filename = $env:Computername+"_server_"+$run_datime.ToString('MM_dd_yyyy_hh_mm_ss')
- $objserver | Export-Clixml "$targer_path\ServerDetails\$filename.xml"
 
- $json = ConvertTo-Json -InputObject $objserver -Depth 5
- $json | Out-File "$target_path\ServerDetails\$filename.json"
- return $filename
+#region Windows Cluster
+if ($cluster_flag) {
+    $clustername = (Get-ItemProperty "HKLM:\Cluster").ClusterName
+    $obj_cluster = [PSCustomObject]@{ ClusterName = $clustername }
 
+    if (($services | Where-Object { $_.Name -eq "ClusSvc" }).State -eq "Running") {
+        $clu_resources = Get-ClusterResource | Select-Object Name, State, OwnerGroup, ResourceType
+        $clu_groups    = Get-ClusterGroup |
+            Where-Object { $_.Name -ne "Available Storage" -and $_.Name -ne "Cluster Group" } |
+            Select-Object Name, State, OwnerNode, GroupType, @{N='is_AutoFailback'; E={$_.AutoFailbackType}}
 
+        $groups = @()
+        foreach ($g in $clu_groups) {
+            $res = $clu_resources | Where-Object { $_.OwnerGroup -eq $g.Name } | ForEach-Object {
+                [PSCustomObject]@{ Name = $_.Name; State = $_.State.ToString(); ResourceType = $_.ResourceType.Name }
+            }
+            $groups += [PSCustomObject]@{
+                GroupName       = $g.Name
+                State           = $g.State.ToString()
+                OwnerNode       = $g.OwnerNode.Name
+                is_AutoFailback = $g.is_AutoFailback
+                Group_Resources = @($res)
+            }
+        }
+        $obj_cluster | Add-Member NoteProperty Cluster_Groups $groups
 
+        $clu_partners = @(Get-ClusterNode | Where-Object { $_.Name -ne $env:COMPUTERNAME } | ForEach-Object {
+            [PSCustomObject]@{ Name = $_.Name; State = $_.State.ToString() }
+        })
+        $obj_cluster | Add-Member NoteProperty Cluster_Partners $clu_partners
+    }
 
+    $obj_server | Add-Member NoteProperty Windows_Cluster $obj_cluster
+}
+#endregion
 
+#region Pending reboot
+$pending = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction SilentlyContinue).PendingFileRenameOperations
+$obj_server.is_PendingFileRenameOperations = [bool]$pending
+#endregion
 
+$filename = "$($env:COMPUTERNAME)_server_$($run_datetime.ToString('MM_dd_yyyy_HH_mm_ss'))"
+$obj_server | Export-Clixml   "$details_path\$filename.xml"
+$obj_server | ConvertTo-Json -Depth 6 | Out-File "$details_path\$filename.json" -Encoding UTF8
 
-
-                                      
+return $filename

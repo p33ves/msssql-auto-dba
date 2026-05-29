@@ -1,103 +1,106 @@
-$targetnode = $args[0]
-$timeout = $args[1]
-$targetpath = $args[2].Replace('$',':')
-$file = "$targetpath\Patch_progress.txt"
-$cluster = $args[3]
-$groups = @()
-$returncode = $null
-$job = @{}
-$count = 0
-$success = $false
+param(
+    [string]$TargetNode,
+    [int]   $Timeout,
+    [string]$TargetPath,
+    [object]$Cluster
+)
+
+$targetpath  = $TargetPath.Replace('$', ':')
+$file        = "$targetpath\Patch_progress.txt"
+$groups      = @()
+$count        = 0
 $success_count = 0
 
-if($targetnode -ne $env:COMPUTERNAME) {
-    $type = "over"
-    $currentgroups = (Get-ClusterGroup | ? {$_.Ownernode -like $env:COMPUTERNAME}).Name
+function log_time {
+    return "[$(((Get-Date).ToUniversalTime()).ToString())] --"
+}
+
+if ($TargetNode -ne $env:COMPUTERNAME) {
+    $type          = "over"
+    $currentgroups = (Get-ClusterGroup | Where-Object { $_.OwnerNode -like $env:COMPUTERNAME }).Name
 }
 else {
     $type = "back"
 }
 
-function log_time {
-   $datime = ((Get-Date).ToUniversalTime().ToString())
-   return "[$datime] --"
-}
-
-foreach($group in $cluster.Cluster_Groups) {
+foreach ($group in $Cluster.Cluster_Groups) {
     $gname = $group.GroupName
-    if((($type -eq "over") -and ($gname -in $currentgroups)) -or (($type -eq "back" -and ($group.Ownernode -eq $env:COMPUTERNAME))) {
-        if([bool]($group.Group_Resources | ? {$_.ResourceType -eq "SQL Server"})) {
-            $group | Add-Member -MemberType NoteProperty -Name GroupType -Value "SQL Group"
-            $group | Add-Member -MemberType NoteProperty -Name MoveResult -Value "NA"
+    $owned = ($type -eq "over" -and $gname -in $currentgroups) -or
+             ($type -eq "back" -and $group.OwnerNode -eq $env:COMPUTERNAME)
+
+    if ($owned) {
+        if ([bool]($group.Group_Resources | Where-Object { $_.ResourceType -eq "SQL Server" })) {
+            $group | Add-Member -MemberType NoteProperty -Name GroupType   -Value "SQL Group" -Force
+            $group | Add-Member -MemberType NoteProperty -Name MoveResult  -Value "NA"        -Force
             $datime = log_time
-            Add-Content $file -Value "$datime Moving $gname to $targetnode"
+            Add-Content $file -Value "$datime Moving $gname to $TargetNode"
             $job = Start-Job -Name "move_$gname" -ScriptBlock {
-                param([string]$gname,$targetnode) Move-ClusterGroup -Name $gname -Node $targetnode
-            } -ArgumentList $gname,$targetnode
-            $group | Add-Member -MemberType NoteProperty -Name MoveJob -Value $job
+                param([string]$gname, [string]$targetnode)
+                Move-ClusterGroup -Name $gname -Node $targetnode
+            } -ArgumentList $gname, $TargetNode
+            $group | Add-Member -MemberType NoteProperty -Name MoveJob -Value $job -Force
             $count++
         }
-        elseif ([bool]($group.Group_Resources | ? {$_.ResourceType -eq "SQL Server Availability Group"})) {
-            $group | Add-Member -MemberType NoteProperty -Name GroupType -Value "AG Group"            
+        elseif ([bool]($group.Group_Resources | Where-Object { $_.ResourceType -eq "SQL Server Availability Group" })) {
+            $group | Add-Member -MemberType NoteProperty -Name GroupType -Value "AG Group"    -Force
         }
         else {
-            $group | Add-Member -MemberType NoteProperty -Name GroupType -Value "Other Group"
+            $group | Add-Member -MemberType NoteProperty -Name GroupType -Value "Other Group" -Force
         }
         $groups += $group
     }
 }
 
 $timer = 0
-while ($timer -lt $timeout) {
+while ($timer -lt $Timeout) {
     Start-Sleep -Seconds 30
     $timer++
-    $cc = 0
+    $pending = 0
+
     foreach ($group in $groups) {
         $gname = $group.GroupName
-        if (($group.GroupType -eq "SQL Group") -and ($group.MoveResult -eq "NA")) {
-            $cc++
-            $job = $group.MoveJob
+        if ($group.GroupType -eq "SQL Group" -and $group.MoveResult -eq "NA") {
+            $pending++
+            $job    = $group.MoveJob
             $datime = log_time
             if ($job.State -eq "Completed") {
                 if ((Get-ClusterGroup $gname).State -eq "Online") {
-                    Add-Content $file -Value "$datime $gname is Failover $type to $targetnode"
+                    Add-Content $file -Value "$datime $gname Fail$type to $TargetNode succeeded"
                     $group.MoveResult = "Success"
                     $success_count++
                 }
                 else {
-                    Add-Content $file -Value "$datime $gname is Failed $type to $targetnode, but not online"
+                    Add-Content $file -Value "$datime $gname Fail$type to $TargetNode completed but group is offline"
                     $group.MoveResult = "Offline"
                 }
-                Remove-Job -Name "move_$gname"
+                Remove-Job -Name "move_$gname" -Force
             }
             elseif ($job.State -eq "Failed") {
-                $reason = $job.JobstateInfo.$reason
-                Add-Content $file -Value "$datime $gname- Fail $type to $targetnode failed due to: $reason"
+                $reason = $job.JobStateInfo.Reason
+                Add-Content $file -Value "$datime $gname Fail$type to $TargetNode failed: $reason"
                 $group.MoveResult = "Failed"
+                Remove-Job -Name "move_$gname" -Force
             }
         }
     }
-    if(![bool]$cc) {
-        Break;
-    }
+
+    if ($pending -eq 0) { break }
 }
 
 $datime = log_time
-if($timer -ge $timeout) {
-    Add-Content $file -Value "$datime Fail$type timed out"
+if ($timer -ge $Timeout) {
+    Add-Content $file -Value "$datime Fail$type timed out after $Timeout iterations"
 }
 elseif ($count -eq 0) {
-    Add-Content $file -Value "$datime No SQL Server roles on $env:COMPUTERNAME"
+    Add-Content $file -Value "$datime No SQL Server roles found on $env:COMPUTERNAME"
 }
 elseif ($count -eq $success_count) {
     Add-Content $file -Value "$datime Fail$type successful for $count roles"
 }
 else {
-    foreach ($group in $groups) {
-        if ($group.MoveResult -ne "Success") {
-            $gname = $group.GroupName
-            Add-Content $file -Value "$datime Unable to fail$type $gname successfully"
-        }
+    foreach ($group in $groups | Where-Object { $_.MoveResult -ne "Success" }) {
+        Add-Content $file -Value "$datime Unable to fail$type $($group.GroupName) successfully (result: $($group.MoveResult))"
     }
 }
+
 return $groups
